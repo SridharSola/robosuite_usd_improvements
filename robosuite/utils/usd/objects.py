@@ -43,6 +43,17 @@ class USDObject(abc.ABC):
        in the scene.
     """
 
+    @staticmethod
+    def factory(stage, model, geom, original_geom, obj_name, rgba=np.array([1, 1, 1, 1]), texture_file=None):
+        """Factory method to create appropriate USD object based on geom type."""
+        if geom.objtype == mujoco.mjtObj.mjOBJ_MESH:
+            return USDMesh(stage, model, geom, obj_name, rgba, texture_file)
+        elif geom.objtype == mujoco.mjtObj.mjOBJ_TENDON:
+            mesh_config = shapes_module.get_tendon_mesh_config(geom.size)
+            return USDTendon(mesh_config, stage, model, geom, obj_name, rgba, texture_file)
+        else:
+            return USDPrimitiveMesh(stage, model, geom, obj_name, rgba, texture_file)
+
     def __init__(
         self,
         stage: Usd.Stage,
@@ -55,18 +66,54 @@ class USDObject(abc.ABC):
         self.stage = stage
         self.model = model
         self.geom = geom
-        self.obj_name = obj_name
+        # Ensure obj_name is a valid string for a path
+        if isinstance(obj_name, np.ndarray):
+            obj_name = f"array_{hash(obj_name.tobytes())}"
+        self.obj_name = str(obj_name).replace(" ", "_").replace("[", "").replace("]", "").replace(".", "_")
         self.rgba = rgba
         self.texture_file = texture_file
 
-        self.xform_path = f"/World/Mesh_Xform_{obj_name}"
-        self.usd_xform = UsdGeom.Xform.Define(stage, self.xform_path)
-
-        # defining ops required by update function
+        # Create path string first, then convert to Sdf.Path
+        xform_path_str = f"/World/Mesh_Xform_{self.obj_name}"
+        self.xform_path = Sdf.Path(xform_path_str)
+        
+        # Use stage for Define, not model
+        self.usd_xform = UsdGeom.Xform.Define(self.stage, self.xform_path)
+        
+        # Single transform operation
         self.transform_op = self.usd_xform.AddTransformOp()
         self.scale_op = self.usd_xform.AddScaleOp()
 
         self.last_visible_frame = -2
+
+        # Get mesh name if it exists
+        mesh_name = None
+        if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_id = model.geom_dataid[geom.objid]
+            if mesh_id >= 0:
+                mesh_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, mesh_id)
+
+        # Check if this is a visual geom based on various conditions
+        self.is_visual_geom = (
+            # Check geom name for _vis/visual
+            "_vis" in obj_name.lower() or 
+            "visual" in obj_name.lower() or
+            # Check mesh name for _vis/visual and ensure it's not a collision mesh
+            (mesh_name and 
+             ("_vis" in mesh_name.lower() or "visual" in mesh_name.lower()) and
+             not any(x in mesh_name.lower() for x in ["_coll", "collision"])) or
+            # Special case for household objects that don't follow the _vis pattern
+            (mesh_name and mesh_name.endswith("_vis"))
+        )
+        self.is_visual_geom = self.is_visual_geom #and self.rgba[3] != 0
+        if mesh_name and self.is_visual_geom and "counter" in obj_name.lower():
+            print(f"\nVisibility check for {obj_name}:")
+            print(f"  Mesh name: {mesh_name}")
+            print(f"  Is visual: {self.is_visual_geom}")
+        # If it's not a visual geom, set initial visibility to invisible
+        #if not self.is_visual_geom:
+        #print("Here")
+        self.update_visibility(self.is_visual_geom)
 
     @abc.abstractmethod
     def _get_uv_geometry(self):
@@ -79,95 +126,129 @@ class USDObject(abc.ABC):
         raise NotImplementedError
 
     def attach_image_material(self, usd_mesh):
-        """Attaches an image texture to a material for a USD object."""
+        """Attaches a textured material to a USD object."""
         mtl_path = Sdf.Path(f"/World/_materials/Material_{self.obj_name}")
         mtl = UsdShade.Material.Define(self.stage, mtl_path)
-
-        bsdf_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("Principled_BSDF"))
-        image_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("Image_Texture"))
-        uvmap_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("uvmap"))
-
-        # setting the bsdf shader attributes
-        bsdf_shader.CreateIdAttr("UsdPreviewSurface")
-        bsdf_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
-            image_shader.ConnectableAPI(), "rgb"
-        )
-        bsdf_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(self.rgba[-1]))
-        bsdf_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(self.geom.shininess)
-        bsdf_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0 - self.geom.shininess)
-
-        mtl.CreateSurfaceOutput().ConnectToSource(bsdf_shader.ConnectableAPI(), "surface")
-
-        # setting the image texture attributes
-        image_shader.CreateIdAttr("UsdUVTexture")
-        image_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(self.texture_file)
-        image_shader.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
-        image_shader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
-        image_shader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
-        image_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
-            uvmap_shader.ConnectableAPI(), "result"
-        )
-        image_shader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
-
-        # setting uvmap shader attributes
-        uvmap_shader.CreateIdAttr("UsdPrimvarReader_float2")
-        uvmap_shader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("UVMap")
-        uvmap_shader.CreateOutput("results", Sdf.ValueTypeNames.Float2)
-
-        mtl.CreateSurfaceOutput().ConnectToSource(bsdf_shader.ConnectableAPI(), "surface")
-
-        usd_mesh.GetPrim().ApplyAPI(UsdShade.MaterialBindingAPI)
-        UsdShade.MaterialBindingAPI(usd_mesh).Bind(mtl)
+        
+        if self.texture_file:
+            #print(f"\nSetting up texture for {self.obj_name}:")
+            #print(f"  Texture file: {self.texture_file}")
+            
+            # Create shaders
+            pbr_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("Principled_BSDF"))
+            texture_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("diffuseTexture"))
+            uvmap_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("uvmap"))
+            
+            # Set shader IDs
+            pbr_shader.CreateIdAttr("UsdPreviewSurface")
+            texture_shader.CreateIdAttr("UsdUVTexture")
+            uvmap_shader.CreateIdAttr("UsdPrimvarReader_float2")
+            
+            # Setup texture
+            texture_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+                self.texture_file if not self.texture_file.startswith('@') else self.texture_file.strip('@'))
+            texture_shader.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+            texture_shader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+            texture_shader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+            
+            # Setup UV coordinates
+            uvmap_shader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+            uvmap_shader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+            texture_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(uvmap_shader.ConnectableAPI(), "result")
+            texture_shader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+            
+            # Connect texture to shader
+            pbr_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(texture_shader.ConnectableAPI(), "rgb")
+            
+            # Set other material properties
+            pbr_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(self.rgba[-1]))
+            pbr_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(self.geom.shininess)
+            pbr_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0 - self.geom.shininess)
+            pbr_shader.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set((1.0, 1.0, 1.0))
+            pbr_shader.CreateInput("clearcoat", Sdf.ValueTypeNames.Float).Set(1.0)
+            
+            if self.geom.shininess > 0.8:  # If highly metallic
+                pbr_shader.CreateInput("baseColor", Sdf.ValueTypeNames.Color3f).Set((0.8, 0.8, 0.8))
+            
+            if self.rgba[-1] < 1.0:  # If there's transparency
+                pbr_shader.CreateInput("ior", Sdf.ValueTypeNames.Float).Set(1.5)  # Index of refraction
+                pbr_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(self.rgba[-1])
+            
+            # Connect shader to material
+            mtl.CreateSurfaceOutput().ConnectToSource(pbr_shader.ConnectableAPI(), "surface")
+            
+            # Apply material binding API and bind material
+            usd_mesh.GetPrim().ApplyAPI(UsdShade.MaterialBindingAPI)
+            UsdShade.MaterialBindingAPI(usd_mesh).Bind(mtl)
 
     def attach_solid_material(self, usd_mesh):
-        """Attaches an solid texture to a material for a USD object."""
+        """Attaches a solid colored material to a USD object."""
         mtl_path = Sdf.Path(f"/World/_materials/Material_{self.obj_name}")
         mtl = UsdShade.Material.Define(self.stage, mtl_path)
-
-        bsdf_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("Principled_BSDF"))
-
-        # settings the bsdf shader attributes
-        bsdf_shader.CreateIdAttr("UsdPreviewSurface")
-
-        bsdf_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(tuple(self.rgba[0:3]))
-        bsdf_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(self.rgba[-1]))
-        bsdf_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(self.geom.shininess)
-        bsdf_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0 - self.geom.shininess)
-
-        mtl.CreateSurfaceOutput().ConnectToSource(bsdf_shader.ConnectableAPI(), "surface")
-
-        usd_mesh.GetPrim().ApplyAPI(UsdShade.MaterialBindingAPI)
+        
+        # Create shader
+        pbr_shader = UsdShade.Shader.Define(self.stage, mtl_path.AppendPath("Principled_BSDF"))
+        pbr_shader.CreateIdAttr("UsdPreviewSurface")
+        
+        # Use rgba values for color
+        material_color = self.rgba[:3]
+        
+        # Set material properties
+        pbr_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(tuple(material_color))
+        pbr_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(self.rgba[-1]))
+        
+        # Add these lines for glass/metallic properties
+        if hasattr(self.geom, 'specular'):
+            pbr_shader.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set((1.0, 1.0, 1.0))
+            pbr_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(self.geom.specular)
+        
+        if hasattr(self.geom, 'reflectance'):
+            pbr_shader.CreateInput("clearcoat", Sdf.ValueTypeNames.Float).Set(self.geom.reflectance)
+            pbr_shader.CreateInput("clearcoatRoughness", Sdf.ValueTypeNames.Float).Set(0.1)
+        
+        # Connect shader to material
+        mtl.CreateSurfaceOutput().ConnectToSource(pbr_shader.ConnectableAPI(), "surface")
+        
+        # Bind material to mesh
         UsdShade.MaterialBindingAPI(usd_mesh).Bind(mtl)
+        if "cab_1_left_group_right_door_door" in self.obj_name and "visual" in self.obj_name:
+            print(f"\nMaterial for {self.obj_name}:")
+            #pr
 
     def _set_refinement_properties(self, usd_prim, scheme="none"):
         usd_prim.GetAttribute("subdivisionScheme").Set(scheme)
 
-    def update(
-        self,
-        pos: np.ndarray,
-        mat: np.ndarray,
-        visible: bool,
-        frame: Optional[int] = None,
-        scale: Optional[np.ndarray] = None,
-    ):
-        """Updates the position and orientation of an object
-        in the scene for a given frame.
-        """
-        transformation_mat = utils_module.create_transform_matrix(rotation_matrix=mat, translation_vector=pos).T
-        utils_module.set_attr(attr=self.transform_op, value=Gf.Matrix4d(transformation_mat.tolist()), frame=frame)
+    def update(self, pos, mat, visible, frame=None, scale=None):
+        """Updates the position and orientation of an object in the scene."""
+        # Quantize positions to ensure consistency
+        pos = np.round(pos, decimals=6)
+        mat = np.round(mat, decimals=6)
+        
+        # Create transformation matrix with validation
+        transformation_mat = utils_module.create_transform_matrix(
+            rotation_matrix=mat,
+            translation_vector=pos
+        ).T
+        
+        # Set transform with frame tracking
+        utils_module.set_attr(
+            attr=self.transform_op,
+            value=Gf.Matrix4d(transformation_mat.tolist()),
+            frame=frame
+        )
 
-        # TODO (ajoshi): update visibility for online and offline cases
-        if not frame and not visible:
-            self.update_visibility(False, frame)
+        # Only update visibility for visual geoms
+        if self.is_visual_geom:
+            if not frame and not visible:
+                self.update_visibility(False, frame)
 
-        if frame is not None:
-            if visible and frame - self.last_visible_frame > 1:
-                # non consecutive visible frames
-                self.update_visibility(False, max(0, self.last_visible_frame))
-                self.update_visibility(True, frame)
+            if frame is not None:
+                if visible and frame - self.last_visible_frame > 1:
+                    self.update_visibility(False, max(0, self.last_visible_frame))
+                    self.update_visibility(True, frame)
 
-            if visible:
-                self.last_visible_frame = frame
+                if visible:
+                    self.last_visible_frame = frame
 
         if scale is not None:
             self.update_scale(scale, frame)
@@ -177,9 +258,21 @@ class USDObject(abc.ABC):
         visibility_setting = "inherited" if visible else "invisible"
         utils_module.set_attr(attr=self.usd_xform.GetVisibilityAttr(), value=visibility_setting, frame=frame)
 
-    def update_scale(self, scale: np.ndarray, frame: Optional[int] = None):
-        """Updates the scale of an object in the scene for a given frame."""
-        utils_module.set_attr(attr=self.scale_op, value=Gf.Vec3f(scale.tolist()), frame=frame)
+    def update_scale(self, scale: np.ndarray, frame: Optional[int]):
+        """Updates the scale of the tendon."""
+        utils_module.set_attr(attr=self.scale_op, value=Gf.Vec3f(float(scale[0]), float(scale[1]), float(scale[2])), frame=frame)
+
+    def update_material_color(self, color):
+        """Updates the material color for an object."""
+        mtl_path = Sdf.Path(f"/World/_materials/Material_{self.obj_name}")
+        material = UsdShade.Material.Get(self.stage, mtl_path)
+        
+        if material:
+            shader = UsdShade.Shader.Get(self.stage, mtl_path.AppendPath("Principled_BSDF"))
+            if shader:
+                diffuse_input = shader.GetInput("diffuseColor")
+                if diffuse_input:
+                    diffuse_input.Set(tuple(color))
 
 
 class USDMesh(USDObject):
@@ -213,7 +306,7 @@ class USDMesh(USDObject):
             # setting mesh uv properties
             mesh_texcoord, mesh_facetexcoord = self._get_uv_geometry()
             self.texcoords = UsdGeom.PrimvarsAPI(self.usd_mesh).CreatePrimvar(
-                "UVMap",
+                "st",
                 Sdf.ValueTypeNames.TexCoord2fArray,
                 UsdGeom.Tokens.faceVarying,
             )
@@ -302,7 +395,7 @@ class USDPrimitiveMesh(USDObject):
             # setting mesh uv properties
             mesh_texcoord, _ = self._get_uv_geometry()
             self.texcoords = UsdGeom.PrimvarsAPI(self.usd_mesh).CreatePrimvar(
-                "UVMap",
+                "st",
                 Sdf.ValueTypeNames.TexCoord2fArray,
                 UsdGeom.Tokens.faceVarying,
             )
@@ -403,7 +496,7 @@ class USDTendon(USDObject):
             part_uv_geometries = self._get_uv_geometry()
             for name, part_uv_geometry in part_uv_geometries.items():
                 self.texcoords = UsdGeom.PrimvarsAPI(self.usd_refs[name]["usd_mesh"]).CreatePrimvar(
-                    "UVMap",
+                    "st",
                     Sdf.ValueTypeNames.TexCoord2fArray,
                     UsdGeom.Tokens.faceVarying,
                 )
@@ -465,10 +558,18 @@ class USDTendon(USDObject):
         for name in self.tendon_parts:
             if "left" in name:
                 translate = [0, 0, -scale[2] - (scale[0] / 2)]
-                utils_module.set_attr(attr=self.usd_refs[name]["translate_op"], value=Gf.Vec3f(translate), frame=frame)
+                utils_module.set_attr(
+                    attr=self.usd_refs[name]["translate_op"],
+                    value=Gf.Vec3f(translate), 
+                    frame=frame
+                )
             elif "right" in name:
                 translate = [0, 0, scale[2] + (scale[0] / 2)]
-                utils_module.set_attr(attr=self.usd_refs[name]["translate_op"], value=Gf.Vec3f(translate), frame=frame)
+                utils_module.set_attr(
+                    attr=self.usd_refs[name]["translate_op"],
+                    value=Gf.Vec3f(translate), 
+                    frame=frame
+                )
 
     def update_scale(self, scale: np.ndarray, frame: Optional[int]):
         """Updates the scale of the tendon."""

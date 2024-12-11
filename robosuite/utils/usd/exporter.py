@@ -290,6 +290,10 @@ please set shareable to be false.
 
         texture_file = self.texture_files[geom.texid] if geom.texid != -1 else None
 
+        # Skip collision geoms or ensure they're invisible
+        #if "collision" in geom_name.lower():
+        #    geom.rgba[3] = 0.0  # Set alpha to 0 for collision geoms
+
         # handling meshes in our scene
         if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
             usd_geom = object_module.USDMesh(
@@ -336,11 +340,43 @@ please set shareable to be false.
         """Iterate through all geoms in the scene and makes update."""
         for i in range(self.scene.ngeom):
             geom = self.scene.geoms[i]
+            
+            # Get the original name before any suffixes
+            original_name = mujoco.mj_id2name(self.model, geom.objtype, geom.objid) or "None"
+            # Get the full name with suffixes
             geom_name = self._get_geom_name(geom)
+
+            # Get mesh name if it exists
+            mesh_name = None
+            if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+                mesh_id = self.model.geom_dataid[geom.objid]
+                if mesh_id >= 0:
+                    mesh_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_MESH, mesh_id)
 
             if geom_name not in self.geom_names:
                 # load a new object into USD
                 self._load_geom(geom)
+
+            # Check visibility based on both geom name and mesh name
+            is_visual_geom = (
+                # Check geom name for _vis/visual
+                "_vis" in original_name.lower() or 
+                "visual" in original_name.lower() or
+                # Check mesh name for _vis/visual and ensure it's not a collision mesh
+                (mesh_name and 
+                 ("_vis" in mesh_name.lower() or "visual" in mesh_name.lower()) and
+                 not any(x in mesh_name.lower() for x in ["_coll", "collision"])) or
+                # Special case for household objects that don't follow the _vis pattern
+                (mesh_name and mesh_name.endswith("_vis"))
+            )
+            if mesh_name and is_visual_geom and "toaster" in original_name.lower():
+                pass
+                #print(f"\nVisibility check for {original_name}:")
+                #print(f"  Mesh name: {mesh_name}")
+                #print(f"  Is visual: {is_visual_geom}")
+            
+            # A geom is visible if it's a visual geom and has non-zero alpha
+            visible = is_visual_geom #and geom.rgba[3] != 0
 
             if geom.objtype == mujoco.mjtObj.mjOBJ_TENDON:
                 tendon_scale = geom.size
@@ -348,14 +384,14 @@ please set shareable to be false.
                     pos=geom.pos,
                     mat=geom.mat,
                     scale=tendon_scale,
-                    visible=geom.rgba[3] > 0,
+                    visible=visible,
                     frame=self.updates if not self.online else None,
                 )
             else:
                 self.geom_refs[geom_name].update(
                     pos=geom.pos,
                     mat=geom.mat,
-                    visible=geom.rgba[3] > 0,
+                    visible=visible,
                     frame=self.updates if not self.online else None,
                 )
 
@@ -386,16 +422,43 @@ please set shareable to be false.
                 frame=self.updates,
             )
 
+    def _get_camera_parent(self, camera_name: str) -> Optional[str]:
+        """Get the parent body name for a camera"""
+        camera_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+        if camera_id == -1:
+            return None
+        
+        # Get the body ID this camera is attached to
+        body_id = self.model.cam_bodyid[camera_id]
+        if body_id >= 0:
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name:
+                return f"/World/{body_name}"
+        return "/World"
+
     def _load_cameras(self) -> None:
+        """Initializes cameras in the USD scene"""
         self.usd_cameras = {}
 
-        # add a primary camera for which the scene will be rendered
+        # Add primary camera as world camera
         self.usd_cameras[PRIMARY_CAMERA_NAME] = camera_module.USDCamera(
-            stage=self.stage, camera_name=PRIMARY_CAMERA_NAME
+            stage=self.stage,
+            camera_name=PRIMARY_CAMERA_NAME,
+            parent_path="/World"
         )
+
+        # Add other cameras with proper parenting
         if self.camera_names is not None:
             for camera_name in self.camera_names:
-                self.usd_cameras[camera_name] = camera_module.USDCamera(stage=self.stage, camera_name=camera_name)
+                # Get parent body for this camera
+                parent_path = self._get_camera_parent(camera_name)
+                
+                # Create camera with proper parenting
+                self.usd_cameras[camera_name] = camera_module.USDCamera(
+                    stage=self.stage,
+                    camera_name=camera_name,
+                    parent_path=parent_path
+                )
 
     def _get_camera_orientation(self) -> Tuple[_structs.MjvGLCamera, np.ndarray]:
         avg_camera = mujoco.mjv_averageCamera(self._scene.camera[0], self._scene.camera[1])
@@ -525,6 +588,7 @@ please set shareable to be false.
     def _get_geom_name(self, geom) -> str:
         # adding id as part of name for USD file
         geom_name = mujoco.mj_id2name(self.model, geom.objtype, geom.objid)
+
         if not geom_name:
             geom_name = "None"
         geom_name += f"_id{geom.objid}"
