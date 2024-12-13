@@ -55,7 +55,7 @@ class USDExporter:
         self,
         model: mujoco.MjModel,
         max_geom: int = 10000,
-        output_directory_name: str = "robosuite_usd",
+        output_directory_path: str = "robosuite_usd",
         light_intensity: int = 10000,
         framerate: int = 60,
         shareable: bool = False,
@@ -88,7 +88,7 @@ class USDExporter:
 
         self.model = model
         self.max_geom = max_geom
-        self.output_directory_name = output_directory_name
+        self.output_directory_path = output_directory_path
         self.light_intensity = light_intensity
         self.framerate = framerate
         self.shareable = shareable
@@ -156,7 +156,7 @@ please set shareable to be false.
 
     def _initialize_output_directories(self) -> None:
         """Initializes output directories to store frames and assets"""
-        self.output_directory_path = os.path.expanduser(self.output_directory_name)
+        #self.output_directory_path = os.path.expanduser(self.output_directory_name)
         ROBOSUITE_DEFAULT_LOGGER.info(f"Outputting USD to {self.output_directory_path}")
         if not os.path.exists(self.output_directory_path):
             os.makedirs(self.output_directory_path)
@@ -182,7 +182,16 @@ please set shareable to be false.
         # TODO: remove code once added internally to mujoco
         data_adr = 0
         self.texture_files = []
+        existing_textures = [f for f in os.listdir(self.assets_directory) if f.startswith("texture_") and f.endswith(".png")]
         for texture_id in tqdm.tqdm(range(self.model.ntex)):
+            texture_file_name = f"texture_{texture_id}.png"
+            texture_path = os.path.join(self.assets_directory, texture_file_name)
+            if texture_file_name in existing_textures:
+                if self.shareable:
+                    self.texture_files.append(os.path.join(relative_path, texture_file_name))
+                else:
+                    self.texture_files.append(os.path.abspath(texture_path))
+                continue
             texture_height = self.model.tex_height[texture_id]
             texture_width = self.model.tex_width[texture_id]
             pixels = 3 * texture_height * texture_width
@@ -191,8 +200,6 @@ please set shareable to be false.
             )
             img = ImageOps.flip(img)
 
-            texture_file_name = f"texture_{texture_id}.png"
-            texture_path = os.path.join(self.assets_directory, texture_file_name)
             img.save(texture_path)
 
             relative_path = os.path.relpath(self.assets_directory, self.frames_directory)
