@@ -10,6 +10,7 @@ import time
 import numpy as np
 
 from robosuite.utils.mjcf_utils import save_sim_model
+from robosuite.utils import transform_utils as T
 from robosuite.wrappers import Wrapper
 
 
@@ -148,6 +149,31 @@ class DataCollectionWrapper(Wrapper):
         self._start_new_episode()
         return ret
 
+    def world_to_gripper_frame(self, action, robot, arm):
+        """Convert world frame action to gripper frame."""
+        # Get gripper pose using proper robot attributes
+        gripper_pos = self.sim.data.site_xpos[robot.eef_site_id[arm]]
+        gripper_rot = self.sim.data.site_xmat[robot.eef_site_id[arm]].reshape(3, 3)
+        
+        # Split translation and rotation from action
+        pos_delta = action[:3]
+        rot_delta = action[3:6]
+        
+        # Transform to gripper frame
+        pos_gripper = gripper_rot.T @ pos_delta
+        rot_gripper = gripper_rot.T @ rot_delta
+        
+        return np.concatenate([pos_gripper, rot_gripper, action[6:]])  # Keep gripper action
+
+    def get_joint_positions(self, robot, arm):
+        """Get current joint positions for the specified robot arm."""
+        if hasattr(robot, '_ref_joint_pos_indexes'):
+            # For standard robots
+            start_idx = 0 if arm == "right" else robot._joint_split_idx
+            end_idx = robot._joint_split_idx if arm == "right" else None
+            return robot.sim.data.qpos[robot._ref_joint_pos_indexes[start_idx:end_idx]].copy()
+        return None
+
     def step(self, action):
         """
         Extends vanilla step() function call to accommodate data collection
@@ -175,14 +201,43 @@ class DataCollectionWrapper(Wrapper):
             state = self.env.sim.get_state().flatten()
             self.states.append(state)
 
+            # Get robot and arm (assuming single robot, single arm)
+            robot = self.env.robots[0]
+            arm = robot.arms[0]  # Usually 'right' for single arm
+
+            # Store actions
             info = {}
+            
+            # 1. World frame (original)
             info["actions"] = np.array(action)
+            
+            try:
+                # 2. Gripper frame
+                # Use proper robot model attributes
+                eef_site_id = robot.eef_site_id[arm]
+                gripper_pos = self.env.sim.data.site_xpos[eef_site_id]
+                gripper_rot = self.env.sim.data.site_xmat[eef_site_id].reshape(3, 3)
+                
+                # Convert world frame deltas to gripper frame
+                pos_delta = action[:3]
+                rot_delta = action[3:6]
+                gripper_pos_delta = gripper_rot.T @ pos_delta
+                gripper_rot_delta = gripper_rot.T @ rot_delta
+                
+                info["actions_gripper_frame"] = np.concatenate([
+                    gripper_pos_delta,
+                    gripper_rot_delta,
+                    action[6:]  # Keep gripper action unchanged
+                ])
 
-            # (if applicable) store absolute actions
-            step_info = ret[3]
-            if "action_abs" in step_info.keys():
-                info["actions_abs"] = np.array(step_info["action_abs"])
+                # 3. Joint positions - use robot's joint indexes
+                if hasattr(robot, '_ref_joint_pos_indexes'):
+                    info["joint_positions"] = robot.sim.data.qpos[robot._ref_joint_pos_indexes].copy()
+                    info["joint_velocities"] = robot.sim.data.qvel[robot._ref_joint_vel_indexes].copy()
 
+            except Exception as e:
+                print(f"Warning: Error collecting additional action formats: {e}")
+                
             self.action_infos.append(info)
 
         # check if the demonstration is successful
